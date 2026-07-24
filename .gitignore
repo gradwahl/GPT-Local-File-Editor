@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.mcp-local-token
+.mcp-server-port
+tunnel-client.exe
+New Text Document.txt
+*.log
+.DS_Store

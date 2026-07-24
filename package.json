@@ -1,0 +1,31 @@
+{
+  "name": "chatgpt-local-file-mcp",
+  "version": "0.1.0",
+  "description": "A local MCP server that lets ChatGPT read and edit local files, including an opt-in raw write_any_file(path, content) tool.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev:http": "tsx src/http.ts",
+    "dev:stdio": "tsx src/stdio.ts",
+    "build": "tsc -p tsconfig.json",
+    "start:http": "node dist/src/http.js",
+    "start:stdio": "node dist/src/stdio.js",
+    "doctor": "tsx scripts/doctor.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.13.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
