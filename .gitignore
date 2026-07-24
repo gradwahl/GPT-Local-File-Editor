@@ -3,6 +3,8 @@ dist/
 .env
 .mcp-local-token
 .mcp-server-port
+keys.bat
+keys.txt
 tunnel-client.exe
 New Text Document.txt
 *.log

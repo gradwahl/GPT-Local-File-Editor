@@ -16,6 +16,14 @@ http://127.0.0.1:3333/mcp
 If you expose that endpoint through the OpenAI tunnel client, keep
 `MCP_LOCAL_TOKEN` private and use a long random value.
 
+The MCP access token is a secret value you create yourself. It is not supplied
+by OpenAI; it just needs to match between the local file server and the tunnel
+client. For example:
+
+```text
+7f3a9c1e8b6d4a2f0c5e9b1d6a8f3c0e
+```
+
 ## OpenAI setup
 
 Create an OpenAI API key from the
@@ -64,8 +72,16 @@ Start the tunnel client in a second terminal after the server is running:
 .\2-Run Tunnel Client.bat
 ```
 
-The tunnel client executable is not included in this repository. Put your
-`tunnel-client.exe` in the project root before running the tunnel batch file.
+The Windows batch files save the MCP local token, tunnel id, and OpenAI API key
+to a local `keys.bat` file after you enter them once. On later runs, they load
+that file and only prompt for values that are still missing. Delete `keys.bat`
+if you want to reset the saved values.
+
+The tunnel client executable is not included in this repository. Download
+`start-tunnel.exe` from the
+[OpenAI tunnel-client releases](https://github.com/openai/tunnel-client/releases),
+rename or copy it to `tunnel-client.exe`, and put it in the project root before
+running the tunnel batch file.
 
 ## Where do I enter the tunnel id?
 
@@ -103,6 +119,9 @@ $env:CONTROL_PLANE_API_KEY="your-api-key"
 
 ## Where do I enter the local MCP token?
 
+This is the MCP access token you create yourself. Use a long random value, then
+enter the same value in both batch files when prompted.
+
 Run `1-Run File Server.bat`. It prompts for:
 
 ```text
@@ -115,5 +134,5 @@ Or create a local `.env` file from `.env.example` and set:
 MCP_LOCAL_TOKEN=your-long-random-secret
 ```
 
-Do not commit `.env`, `.mcp-local-token`, `.mcp-server-port`,
-`tunnel-client.exe`, `dist/`, or `node_modules/`.
+Do not commit `.env`, `.mcp-local-token`, `.mcp-server-port`, `keys.bat`,
+`keys.txt`, `tunnel-client.exe`, `dist/`, or `node_modules/`.
