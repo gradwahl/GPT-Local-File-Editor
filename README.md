@@ -120,7 +120,8 @@ $env:CONTROL_PLANE_API_KEY="your-api-key"
 ## Where do I enter the local MCP token?
 
 This is the MCP access token you create yourself. Use a long random value, then
-enter the same value in both batch files when prompted.
+enter the same value in both batch files when prompted. `2-Run Tunnel Client.bat`
+must use the same `MCP_LOCAL_TOKEN` as `1-Run File Server.bat`.
 
 Run `1-Run File Server.bat`. It prompts for:
 
@@ -135,4 +136,6 @@ MCP_LOCAL_TOKEN=your-long-random-secret
 ```
 
 Do not commit `.env`, `.mcp-local-token`, `.mcp-server-port`, `keys.bat`,
-`keys.txt`, `tunnel-client.exe`, `dist/`, or `node_modules/`.
+`keys.txt`, `tunnel-client.exe`, `dist/`, or `node_modules/`. These files and
+folders can include sensitive local data, personal keys, saved tokens, or
+machine-specific build output.
