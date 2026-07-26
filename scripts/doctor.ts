@@ -33,6 +33,15 @@ function parseNamedWorkspaces(): Record<string, string> {
   return result;
 }
 
+function envBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase().trim();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 function configuredWorkspace(): { source: string; path: string; named: Record<string, string> } {
   const named = parseNamedWorkspaces();
   const defaultWorkspace = process.env.DEFAULT_WORKSPACE || "";
@@ -53,6 +62,8 @@ async function main(): Promise<void> {
   const backupRetentionDays = Number.parseInt(process.env.BACKUP_RETENTION_DAYS || "0", 10);
   const maxBackupMb = Number.parseInt(process.env.MAX_BACKUP_MB || "0", 10);
   const sessionTtlMs = Number.parseInt(process.env.MCP_SESSION_TTL_MS || "1800000", 10);
+  const searchIndexCacheTtlMs = Number.parseInt(process.env.SEARCH_INDEX_CACHE_TTL_MS || "300000", 10);
+  const searchConcurrency = Number.parseInt(process.env.SEARCH_CONCURRENCY || "16", 10);
 
   await fs.mkdir(workspace.path, { recursive: true });
   await fs.mkdir(path.join(home, "backups"), { recursive: true });
@@ -70,6 +81,12 @@ async function main(): Promise<void> {
   console.log(`HTTP session TTL ms: ${Number.isFinite(sessionTtlMs) ? sessionTtlMs : 1800000}`);
   console.log(`Backup retention days: ${Number.isFinite(backupRetentionDays) ? backupRetentionDays : 0}`);
   console.log(`Max backup MB: ${Number.isFinite(maxBackupMb) ? maxBackupMb : 0}`);
+  console.log(`Search uses ripgrep: ${envBool("SEARCH_USE_RIPGREP", true)}`);
+  console.log(`Search index uses rg --files: ${envBool("SEARCH_USE_RIPGREP_FILES", envBool("SEARCH_USE_RIPGREP", true))}`);
+  console.log(`Search index cache TTL ms: ${Number.isFinite(searchIndexCacheTtlMs) ? searchIndexCacheTtlMs : 300000}`);
+  console.log(`Search concurrency: ${Number.isFinite(searchConcurrency) ? searchConcurrency : 16}`);
+  console.log(`Default write backups: ${envBool("WRITE_CREATE_BACKUP_DEFAULT", true)}`);
+  console.log(`Write SHA-256 hashes: ${envBool("WRITE_COMPUTE_SHA256", true)}`);
 
   if (process.env.ALLOW_QUERY_TOKEN_AUTH === "true") {
     console.warn("Warning: query-token auth is enabled. Use this only for local testing.");

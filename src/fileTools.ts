@@ -4,6 +4,7 @@ import { createReadStream, type Dirent, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import readline from "node:readline";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -47,10 +48,20 @@ type FileIndexResult = {
   skippedFiles: number;
   truncated: boolean;
   fromCache: boolean;
+  engine: "ripgrep-files" | "javascript";
+  error?: string | null;
 };
 
 type SearchIndexCacheEntry = Omit<FileIndexResult, "fromCache"> & {
   createdAtMs: number;
+};
+
+type TreeEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file" | "symlink" | "other";
+  size?: number;
+  children?: TreeEntry[];
 };
 
 type CompiledGlob = {
@@ -88,12 +99,19 @@ const DEFAULT_SEARCH_EXCLUDES = [
   "obj/**",
   "*.min.js",
   "*.map",
+  ".env",
+  ".env.*",
+  "keys.bat",
+  "keys.txt",
+  "tunnel-client.exe",
+  "start-tunnel.exe",
+  "*.exe",
   "package-lock.json",
   "pnpm-lock.yaml",
   "yarn.lock",
 ];
 const DEFAULT_SEARCH_MODE: SearchMode = "both";
-const SEARCH_INDEX_CACHE_TTL_MS = 15_000;
+const SEARCH_INDEX_CACHE_TTL_MS = 300_000;
 const SEARCH_CONCURRENCY = 16;
 const RIPGREP_WINDOWS_ARG_CHARS = 7_000;
 const RIPGREP_POSIX_ARG_CHARS = 120_000;
@@ -304,6 +322,23 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function envBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase().trim();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function shouldComputeWriteSha256(): boolean {
+  return envBool("WRITE_COMPUTE_SHA256", true);
+}
+
+function defaultCreateBackup(): boolean {
+  return envBool("WRITE_CREATE_BACKUP_DEFAULT", true);
+}
+
 function backupRetentionPolicy(): { retentionDays: number; maxBackupMb: number; enabled: boolean } {
   const retentionDays = Math.max(0, envInt("BACKUP_RETENTION_DAYS", 0));
   const maxBackupMb = Math.max(0, envInt("MAX_BACKUP_MB", 0));
@@ -509,11 +544,12 @@ async function writeTextFile(target: string, content: string, createBackup: bool
   const parent = path.dirname(target);
   await fs.mkdir(parent, { recursive: true });
 
-  const beforeSha256 = await sha256File(target);
+  const computeSha256 = shouldComputeWriteSha256();
+  const beforeSha256 = computeSha256 ? await sha256File(target) : null;
   const backupPath = await maybeBackupFile(target, createBackup);
   await atomicWriteUtf8File(target, content);
   invalidateSearchIndexCacheForPath(target);
-  const afterSha256 = sha256Text(content);
+  const afterSha256 = computeSha256 ? sha256Text(content) : null;
   const bytesWritten = Buffer.byteLength(content, "utf8");
 
   const event = {
@@ -522,6 +558,7 @@ async function writeTextFile(target: string, content: string, createBackup: bool
     bytesWritten,
     beforeSha256,
     afterSha256,
+    sha256Computed: computeSha256,
     backupPath,
   };
   await appendAudit(event);
@@ -537,6 +574,51 @@ async function listDir(target: string, maxEntries: number): Promise<Record<strin
     type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : entry.isSymbolicLink() ? "symlink" : "other",
   }));
   return { ok: true, path: target, count: entries.length, truncated: entries.length > listed.length, entries: listed };
+}
+
+async function listWorkspaceTree(relPath: string, maxDepth: number, maxEntries: number): Promise<Record<string, unknown>> {
+  if (maxDepth < 0 || maxDepth > 10) throw new Error("max_depth must be between 0 and 10.");
+  if (maxEntries < 1 || maxEntries > 5000) throw new Error("max_entries must be between 1 and 5,000.");
+
+  const root = await resolveInsideWorkspace(relPath || ".");
+  const workspace = await workspaceRoot();
+  let count = 0;
+  let truncated = false;
+
+  async function visit(current: string, depth: number): Promise<TreeEntry> {
+    const rel = workspaceRelative(workspace, current);
+    const lst = await fs.lstat(current);
+    const type = lst.isDirectory() ? "directory" : lst.isFile() ? "file" : lst.isSymbolicLink() ? "symlink" : "other";
+    const node: TreeEntry = {
+      name: rel === "." ? "." : path.basename(current),
+      path: rel,
+      type,
+      ...(lst.isFile() ? { size: lst.size } : {}),
+    };
+
+    if (!lst.isDirectory() || lst.isSymbolicLink() || depth >= maxDepth || truncated) return node;
+
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      return node;
+    }
+
+    node.children = [];
+    entries.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (count >= maxEntries) {
+        truncated = true;
+        break;
+      }
+      count += 1;
+      node.children.push(await visit(path.join(current, entry.name), depth + 1));
+    }
+    return node;
+  }
+
+  return { ok: true, workspaceRoot: workspace, root: await visit(root, 0), count, truncated, maxDepth, maxEntries };
 }
 
 async function statPath(target: string): Promise<Record<string, unknown>> {
@@ -656,6 +738,11 @@ function shouldUseRipgrep(): boolean {
   return raw !== "0" && raw !== "false" && raw !== "no";
 }
 
+function shouldUseRipgrepFileList(): boolean {
+  const raw = (process.env.SEARCH_USE_RIPGREP_FILES || process.env.SEARCH_USE_RIPGREP || "true").toLowerCase();
+  return raw !== "0" && raw !== "false" && raw !== "no";
+}
+
 function ripgrepBinary(): string {
   return process.env.RIPGREP_PATH || "rg";
 }
@@ -700,9 +787,120 @@ async function getWorkspaceFileIndex(root: string, includeGlobs: string[], exclu
       files: cached.files,
       skippedFiles: cached.skippedFiles,
       truncated: cached.truncated,
+      engine: cached.engine,
+      error: cached.error ?? null,
       fromCache: true,
     };
   }
+
+  let result: SearchIndexCacheEntry;
+  if (shouldUseRipgrepFileList()) {
+    try {
+      result = await buildWorkspaceFileIndexWithRipgrep(root, includeGlobs, excludeGlobs, maxFiles);
+      if (ttlMs > 0) searchIndexCache.set(cacheKey, result);
+      return { ...result, fromCache: false };
+    } catch (err: unknown) {
+      result = await buildWorkspaceFileIndexWithJavaScript(root, includeGlobs, excludeGlobs, maxFiles, (err as Error).message);
+      if (ttlMs > 0) searchIndexCache.set(cacheKey, result);
+      return { ...result, fromCache: false };
+    }
+  }
+
+  result = await buildWorkspaceFileIndexWithJavaScript(root, includeGlobs, excludeGlobs, maxFiles);
+  if (ttlMs > 0) searchIndexCache.set(cacheKey, result);
+  return { ...result, fromCache: false };
+}
+
+async function buildWorkspaceFileIndexWithRipgrep(root: string, includeGlobs: string[], excludeGlobs: string[], maxFiles: number): Promise<SearchIndexCacheEntry> {
+  const args = [
+    "--files",
+    "--no-config",
+    "--no-ignore",
+    ...normalizeGlobList(includeGlobs).flatMap((glob) => ["-g", glob]),
+    ...normalizeGlobList(excludeGlobs).flatMap((glob) => ["-g", `!${glob}`]),
+  ];
+
+  const relFiles = await new Promise<string[]>((resolve, reject) => {
+    const files: string[] = [];
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
+    let truncated = false;
+    let settled = false;
+    const child = spawn(ripgrepBinary(), args, { cwd: root, windowsHide: true });
+
+    function settle(result: string[] | null, err?: Error): void {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(result ?? files);
+    }
+
+    function processLine(line: string): void {
+      const rel = normalizeSlashes(line.trim());
+      if (!rel) return;
+      if (files.length >= maxFiles) {
+        truncated = true;
+        child.kill();
+        return;
+      }
+      files.push(rel);
+    }
+
+    function processChunk(chunk: string, flush = false): void {
+      stdoutBuffer += chunk;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      const remainder = lines.pop() ?? "";
+      for (const line of lines) processLine(line);
+      if (flush && remainder) processLine(remainder);
+      stdoutBuffer = flush ? "" : remainder;
+    }
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => processChunk(chunk));
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderrBuffer += chunk;
+    });
+    child.on("error", (err: NodeJS.ErrnoException) => settle(null, err));
+    child.on("close", (code, signal) => {
+      processChunk("", true);
+      if (truncated || code === 0) {
+        settle(files);
+        return;
+      }
+      const signalText = signal ? ` signal ${signal}` : "";
+      settle(null, new Error(stderrBuffer.trim() || `ripgrep --files exited with code ${code}${signalText}.`));
+    });
+  });
+
+  const files: FileIndexEntry[] = [];
+  let skippedFiles = 0;
+  let truncated = relFiles.length >= maxFiles;
+  await runLimited(relFiles.slice(0, maxFiles), searchConcurrency(), async (rel) => {
+    try {
+      const fullPath = path.join(root, rel);
+      const st = await fs.stat(fullPath);
+      if (!st.isFile()) {
+        skippedFiles += 1;
+        return;
+      }
+      files.push({ rel, fullPath, size: st.size, mtimeMs: st.mtimeMs });
+    } catch {
+      skippedFiles += 1;
+    }
+  });
+
+  files.sort((a, b) => a.rel.localeCompare(b.rel));
+  return { files, skippedFiles, truncated, engine: "ripgrep-files", error: null, createdAtMs: Date.now() };
+}
+
+async function buildWorkspaceFileIndexWithJavaScript(
+  root: string,
+  includeGlobs: string[],
+  excludeGlobs: string[],
+  maxFiles: number,
+  error: string | null = null
+): Promise<SearchIndexCacheEntry> {
 
   const includeMatchers = compileGlobs(includeGlobs);
   const excludeMatchers = compileGlobs(excludeGlobs);
@@ -773,10 +971,7 @@ async function getWorkspaceFileIndex(root: string, includeGlobs: string[], exclu
 
   await visit(root);
 
-  const result = { files, skippedFiles, truncated, createdAtMs: Date.now() };
-  if (ttlMs > 0) searchIndexCache.set(cacheKey, result);
-
-  return { files, skippedFiles, truncated, fromCache: false };
+  return { files, skippedFiles, truncated, engine: "javascript", error, createdAtMs: Date.now() };
 }
 
 function previewLine(line: string, index: number, needleLength: number): string {
@@ -972,7 +1167,6 @@ async function searchContentWithJavaScript(files: FileIndexEntry[], options: {
   let scannedFiles = 0;
   let skippedFiles = 0;
   let truncated = false;
-  const queryBuffer = Buffer.from(options.query, "utf8");
 
   await runLimited(
     files,
@@ -988,66 +1182,94 @@ async function searchContentWithJavaScript(files: FileIndexEntry[], options: {
         return;
       }
 
-      let buffer: Buffer;
       try {
-        buffer = await fs.readFile(file.fullPath);
-      } catch {
-        skippedFiles += 1;
-        return;
-      }
+        const stream = createReadStream(file.fullPath, { encoding: "utf8" });
+        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+        let lineIndex = 0;
+        let sawNul = false;
 
-      scannedFiles += 1;
+        for await (const line of rl) {
+          lineIndex += 1;
+          if (line.includes("\0")) {
+            sawNul = true;
+            rl.close();
+            stream.destroy();
+            break;
+          }
 
-      if (buffer.includes(0)) {
-        skippedFiles += 1;
-        return;
-      }
+          const haystack = options.caseSensitive ? line : line.toLowerCase();
+          if (!haystack.includes(options.needle)) continue;
 
-      let text: string;
-      if (options.caseSensitive) {
-        if (!buffer.includes(queryBuffer)) return;
-        text = buffer.toString("utf8");
-      } else {
-        text = buffer.toString("utf8");
-        if (!text.toLowerCase().includes(options.needle)) return;
-      }
+          let fromIndex = 0;
+          while (true) {
+            const foundAt = haystack.indexOf(options.needle, fromIndex);
+            if (foundAt === -1) break;
 
-      const lines = text.split(/\r?\n/);
-      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-        if (options.shouldStop()) {
-          truncated = true;
+            const added = options.addMatch({
+              path: file.rel,
+              absolutePath: file.fullPath,
+              matchType: "content",
+              line: lineIndex,
+              column: foundAt + 1,
+              preview: previewLine(line, foundAt, options.query.length),
+            });
+
+            if (!added) {
+              truncated = true;
+              rl.close();
+              stream.destroy();
+              return;
+            }
+
+            fromIndex = foundAt + Math.max(options.needle.length, 1);
+          }
+
+          if (options.shouldStop()) {
+            truncated = true;
+            rl.close();
+            stream.destroy();
+            return;
+          }
+        }
+
+        if (sawNul) {
+          skippedFiles += 1;
           return;
         }
 
-        const line = lines[lineIndex];
-        const haystack = options.caseSensitive ? line : line.toLowerCase();
-        let fromIndex = 0;
-        while (true) {
-          const foundAt = haystack.indexOf(options.needle, fromIndex);
-          if (foundAt === -1) break;
-
-          const added = options.addMatch({
-            path: file.rel,
-            absolutePath: file.fullPath,
-            matchType: "content",
-            line: lineIndex + 1,
-            column: foundAt + 1,
-            preview: previewLine(line, foundAt, options.query.length),
-          });
-
-          if (!added) {
-            truncated = true;
-            return;
-          }
-
-          fromIndex = foundAt + Math.max(options.needle.length, 1);
-        }
+        scannedFiles += 1;
+      } catch {
+        skippedFiles += 1;
+        return;
       }
     },
     options.shouldStop
   );
 
   return { scannedFiles, skippedFiles, truncated };
+}
+
+async function readWorkspaceFiles(paths: string[], maxBytesPerFile: number): Promise<Record<string, unknown>> {
+  if (paths.length < 1 || paths.length > 50) throw new Error("paths must include between 1 and 50 files.");
+  if (maxBytesPerFile < 1 || maxBytesPerFile > 2_000_000) throw new Error("max_bytes_per_file must be between 1 and 2,000,000.");
+
+  const results: Array<Record<string, unknown>> = [];
+  await runLimited(paths, searchConcurrency(), async (relPath) => {
+    try {
+      const target = await resolveInsideWorkspace(relPath);
+      const result = await readTextFile(target, maxBytesPerFile);
+      results.push({ ok: true, requestedPath: relPath, path: target, ...result });
+    } catch (err: unknown) {
+      results.push({ ok: false, requestedPath: relPath, error: (err as Error).message });
+    }
+  });
+
+  return {
+    ok: true,
+    count: results.length,
+    maxBytesPerFile,
+    files: results.sort((a, b) => String(a.requestedPath).localeCompare(String(b.requestedPath))),
+  };
 }
 
 async function searchWorkspaceFiles(options: {
@@ -1154,6 +1376,8 @@ async function searchWorkspaceFiles(options: {
     maxFiles: options.maxFiles,
     maxFileBytes: options.maxFileBytes,
     indexedFiles: fileIndex.files.length,
+    indexEngine: fileIndex.engine,
+    indexError: fileIndex.error ?? null,
     indexFromCache: fileIndex.fromCache,
     searchIndexCacheTtlMs: searchIndexCacheTtlMs(),
     searchConcurrency: searchConcurrency(),
@@ -1252,6 +1476,12 @@ export function registerFileTools(server: McpServer): void {
           mcpHome: mcpHome(),
           backups: path.join(mcpHome(), "backups"),
           backupRetention: backupRetentionPolicy(),
+          defaultCreateBackup: defaultCreateBackup(),
+          writeSha256Enabled: shouldComputeWriteSha256(),
+          searchIndexCacheTtlMs: searchIndexCacheTtlMs(),
+          searchConcurrency: searchConcurrency(),
+          searchUseRipgrep: shouldUseRipgrep(),
+          searchUseRipgrepFiles: shouldUseRipgrepFileList(),
           auditLog: path.join(mcpHome(), "audit", "writes.jsonl"),
         });
       } catch (err: unknown) {
@@ -1394,6 +1624,47 @@ export function registerFileTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "read_workspace_files",
+    {
+      title: "Read multiple workspace files",
+      description: "Reads up to 50 UTF-8 text files inside WORKSPACE_ROOT in one MCP call. Paths must be relative to the workspace root.",
+      inputSchema: {
+        paths: z.array(z.string()).min(1).max(50),
+        max_bytes_per_file: z.number().int().min(1).max(2_000_000).default(200_000),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ paths, max_bytes_per_file = 200_000 }) => {
+      try {
+        return ok(await readWorkspaceFiles(paths, max_bytes_per_file));
+      } catch (err: unknown) {
+        return fail((err as Error).message);
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_workspace_tree",
+    {
+      title: "List workspace tree",
+      description: "Returns a compact directory tree under WORKSPACE_ROOT. Useful for orienting before reading files.",
+      inputSchema: {
+        path: z.string().default("."),
+        max_depth: z.number().int().min(0).max(10).default(3),
+        max_entries: z.number().int().min(1).max(5000).default(500),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ path: relPath = ".", max_depth = 3, max_entries = 500 }) => {
+      try {
+        return ok(await listWorkspaceTree(relPath, max_depth, max_entries));
+      } catch (err: unknown) {
+        return fail((err as Error).message);
+      }
+    }
+  );
+
+  server.registerTool(
     "write_workspace_file",
     {
       title: "Write workspace file",
@@ -1401,14 +1672,14 @@ export function registerFileTools(server: McpServer): void {
       inputSchema: {
         path: z.string(),
         content: z.string(),
-        create_backup: z.boolean().default(true),
+        create_backup: z.boolean().optional(),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ path: relPath, content, create_backup = true }) => {
+    async ({ path: relPath, content, create_backup }) => {
       try {
         const target = await resolveInsideWorkspace(relPath, { ensureParent: true });
-        return ok(await writeTextFile(target, content, create_backup, "write_workspace_file"));
+        return ok(await writeTextFile(target, content, create_backup ?? defaultCreateBackup(), "write_workspace_file"));
       } catch (err: unknown) {
         return fail((err as Error).message);
       }
@@ -1426,11 +1697,11 @@ export function registerFileTools(server: McpServer): void {
         new_text: z.string(),
         replace_all: z.boolean().default(false),
         expected_replacements: z.number().int().min(0).optional(),
-        create_backup: z.boolean().default(true),
+        create_backup: z.boolean().optional(),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ path: relPath, old_text, new_text, replace_all = false, expected_replacements, create_backup = true }) => {
+    async ({ path: relPath, old_text, new_text, replace_all = false, expected_replacements, create_backup }) => {
       try {
         return ok(
           await replaceInWorkspaceFile({
@@ -1439,7 +1710,7 @@ export function registerFileTools(server: McpServer): void {
             newText: new_text,
             replaceAll: replace_all,
             expectedReplacements: expected_replacements,
-            createBackup: create_backup,
+            createBackup: create_backup ?? defaultCreateBackup(),
           })
         );
       } catch (err: unknown) {
@@ -1456,13 +1727,13 @@ export function registerFileTools(server: McpServer): void {
       inputSchema: {
         path: z.string(),
         content: z.string(),
-        create_backup: z.boolean().default(true),
+        create_backup: z.boolean().optional(),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ path: relPath, content, create_backup = true }) => {
+    async ({ path: relPath, content, create_backup }) => {
       try {
-        return ok(await appendToWorkspaceFile(relPath, content, create_backup));
+        return ok(await appendToWorkspaceFile(relPath, content, create_backup ?? defaultCreateBackup()));
       } catch (err: unknown) {
         return fail((err as Error).message);
       }
@@ -1479,13 +1750,13 @@ export function registerFileTools(server: McpServer): void {
         marker: z.string(),
         content: z.string(),
         occurrence: z.number().int().min(1).default(1),
-        create_backup: z.boolean().default(true),
+        create_backup: z.boolean().optional(),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ path: relPath, marker, content, occurrence = 1, create_backup = true }) => {
+    async ({ path: relPath, marker, content, occurrence = 1, create_backup }) => {
       try {
-        return ok(await insertAfterInWorkspaceFile({ relPath, marker, content, occurrence, createBackup: create_backup }));
+        return ok(await insertAfterInWorkspaceFile({ relPath, marker, content, occurrence, createBackup: create_backup ?? defaultCreateBackup() }));
       } catch (err: unknown) {
         return fail((err as Error).message);
       }
@@ -1564,15 +1835,15 @@ export function registerFileTools(server: McpServer): void {
       inputSchema: {
         path: z.string(),
         content: z.string(),
-        create_backup: z.boolean().default(true),
+        create_backup: z.boolean().optional(),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ path: inputPath, content, create_backup = true }) => {
+    async ({ path: inputPath, content, create_backup }) => {
       try {
         assertRawWriteEnabled();
         const target = abs(inputPath);
-        return ok(await writeTextFile(target, content, create_backup, "write_any_file"));
+        return ok(await writeTextFile(target, content, create_backup ?? defaultCreateBackup(), "write_any_file"));
       } catch (err: unknown) {
         return fail((err as Error).message);
       }

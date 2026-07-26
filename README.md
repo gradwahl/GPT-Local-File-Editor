@@ -1,141 +1,210 @@
 # GPT Local File Editor
 
 A local Model Context Protocol (MCP) file server for ChatGPT. It lets ChatGPT
-read and edit files inside a workspace you choose, with optional dangerous
-raw file access guarded by environment variables.
+read and edit files inside a workspace you choose, with optional raw file access
+guarded by environment variables.
 
-## What is it?
+## Connection options
 
-This project runs an MCP server on your machine. ChatGPT connects to it through
-the HTTP endpoint:
+This repository is source-only. Users install dependencies and build `dist/`
+locally.
 
-```text
-http://127.0.0.1:3333/mcp
-```
+ChatGPT can connect to this MCP server in three ways:
 
-If you expose that endpoint through the OpenAI tunnel client, keep
-`MCP_LOCAL_TOKEN` private and use a long random value.
+- **ChatGPT Chat, fastest path:** Secure MCP Tunnel -> tunnel client -> local
+  STDIO server.
+- **ChatGPT Chat, HTTP path:** Secure MCP Tunnel -> tunnel client -> local HTTP
+  server at `http://127.0.0.1:3333/mcp`.
+- **ChatGPT Desktop / Codex:** local STDIO server directly, with no tunnel.
 
-The MCP access token is a secret value you create yourself. It is not supplied
-by OpenAI; it just needs to match between the local file server and the tunnel
-client. For example:
+For regular ChatGPT Chat, the fastest supported path is still through a Secure
+MCP Tunnel because ChatGPT Chat cannot start a local STDIO process directly.
+The local HTTP server is optional when you use the STDIO tunnel launcher.
 
-```text
-7f3a9c1e8b6d4a2f0c5e9b1d6a8f3c0e
-```
+## Prerequisites
 
-## OpenAI setup
+- Node.js 20 or newer
+- An OpenAI API key for the tunnel client
+- A Secure MCP Tunnel ID from
+  [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels)
+- `start-tunnel.exe` from the
+  [OpenAI tunnel-client releases](https://github.com/openai/tunnel-client/releases)
+- Optional but recommended:
+  [ripgrep](https://github.com/BurntSushi/ripgrep) for fast search
 
-Create an OpenAI API key from the
-[API keys page](https://platform.openai.com/api-keys). The full secret is only
-shown once, so save it somewhere private.
+Put `start-tunnel.exe` in the project root. The batch launchers copy it to
+`tunnel-client.exe` automatically when needed.
 
-Create or manage a Secure MCP Tunnel from
-[Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
-Copy the tunnel id for the tunnel you want to use.
-
-In ChatGPT on the web, open Settings -> Plugins or go to
-[chatgpt.com/plugins](https://chatgpt.com/plugins). Add a developer-mode app,
-choose Tunnel as the connection type, then select your tunnel from the list or
-paste the tunnel id. The tunnel must be selected there before ChatGPT can use
-this local MCP server.
-
-## Build it
-
-Install Node.js 20 or newer, then run:
+## Install and build
 
 ```powershell
+git clone https://github.com/your-name/GPT-Local-File-Editor.git
+cd GPT-Local-File-Editor
 npm install
 npm run build
 ```
 
-The build output is written to `dist/`. It is not committed; each user builds
-it locally.
+The build output is written to `dist/`. It is ignored by Git and should not be
+committed.
 
-## Run it
+## Configure `.env`
 
-Start the file server:
+Copy `.env.example` to `.env` and edit the local values:
 
 ```powershell
-npm run start:http
+copy .env.example .env
 ```
 
-For a guided Windows prompt, run:
+At minimum, set the workspace folder ChatGPT is allowed to edit:
+
+```env
+WORKSPACE_ROOT=C:\Users\YourName\Documents\ChatGPT-editable
+```
+
+Raw arbitrary-path reads are enabled with this exact phrase:
+
+```env
+ALLOW_RAW_READ_ANY_FILE=I_UNDERSTAND_THIS_CAN_READ_PRIVATE_FILES
+```
+
+For the HTTP tunnel path, also set or enter a private local token:
+
+```env
+MCP_LOCAL_TOKEN=change-me-to-a-long-random-secret
+```
+
+Search uses ripgrep when available:
+
+```env
+SEARCH_USE_RIPGREP=true
+SEARCH_USE_RIPGREP_FILES=true
+SEARCH_INDEX_CACHE_TTL_MS=300000
+```
+
+If the server cannot find `rg` on PATH, set:
+
+```env
+RIPGREP_PATH=C:\full\path\to\rg.exe
+```
+
+## ChatGPT Chat: fastest STDIO tunnel
+
+Use this for the lowest-latency ChatGPT Chat setup:
+
+```text
+ChatGPT Chat -> Secure MCP Tunnel -> tunnel-client -> node dist/src/stdio.js
+```
+
+Run:
+
+```powershell
+.\2-Run Tunnel Client STDIO.bat
+```
+
+The script prompts for your OpenAI API key and tunnel ID, saves them locally in
+`keys.bat`, builds the project if `dist/` is missing, and starts the tunnel
+client with:
+
+```text
+--mcp.command "command=node dist/src/stdio.js,channel=main"
+```
+
+You do not need to run `1-Run File Server.bat` in this mode.
+
+In ChatGPT Chat, add or manage the developer-mode MCP app from
+[chatgpt.com/plugins](https://chatgpt.com/plugins) or ChatGPT settings, choose
+Tunnel as the connection type, and select or paste the same tunnel ID.
+
+## ChatGPT Chat: HTTP tunnel
+
+Use this path if you specifically want the local HTTP MCP server:
+
+```text
+ChatGPT Chat -> Secure MCP Tunnel -> tunnel-client -> http://127.0.0.1:3333/mcp
+```
+
+Start the file server:
 
 ```powershell
 .\1-Run File Server.bat
 ```
 
-Start the tunnel client in a second terminal after the server is running:
+Then start the tunnel client in a second terminal:
 
 ```powershell
 .\2-Run Tunnel Client.bat
 ```
 
-The Windows batch files save the MCP local token, tunnel id, and OpenAI API key
-to a local `keys.bat` file after you enter them once. On later runs, they load
-that file and only prompt for values that are still missing. Delete `keys.bat`
-if you want to reset the saved values.
+Both scripts use the same `MCP_LOCAL_TOKEN`. The token is a secret value you
+create yourself; it is not supplied by OpenAI.
 
-The tunnel client executable is not included in this repository. Download
-`start-tunnel.exe` from the
-[OpenAI tunnel-client releases](https://github.com/openai/tunnel-client/releases),
-rename or copy it to `tunnel-client.exe`, and put it in the project root before
-running the tunnel batch file.
+## ChatGPT Desktop / Codex
 
-## Where do I enter the tunnel id?
+Use this only for the ChatGPT desktop app's Codex MCP server settings. It does
+not apply to normal ChatGPT Chat.
 
-Get it from
-[Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels),
-then select or paste the same tunnel in ChatGPT web Plugins.
-
-Run `2-Run Tunnel Client.bat`. It prompts for:
+Add an MCP server with:
 
 ```text
-Enter tunnel id:
+Name: local-file-editor
+Type: STDIO
+Command: node
+Arguments: dist/src/stdio.js
+Working directory: C:\path\to\GPT-Local-File-Editor
 ```
 
-You can also set it yourself before running the client:
+Restart ChatGPT Desktop, then open a Codex task and type `/mcp` to confirm the
+server is connected.
+
+## Useful commands
+
+Build:
 
 ```powershell
-$env:CONTROL_PLANE_TUNNEL_ID="your-tunnel-id"
+npm run build
 ```
 
-## Where do I enter the API key?
-
-Get it from the [API keys page](https://platform.openai.com/api-keys).
-
-Run `2-Run Tunnel Client.bat`. It prompts for:
-
-```text
-Enter OpenAI API key:
-```
-
-You can also set it yourself before running the client:
+Run the HTTP server directly:
 
 ```powershell
-$env:CONTROL_PLANE_API_KEY="your-api-key"
+npm run start:http
 ```
 
-## Where do I enter the local MCP token?
+Run the STDIO server directly for local MCP clients:
 
-This is the MCP access token you create yourself. Use a long random value, then
-enter the same value in both batch files when prompted. `2-Run Tunnel Client.bat`
-must use the same `MCP_LOCAL_TOKEN` as `1-Run File Server.bat`.
+```powershell
+npm run start:stdio
+```
 
-Run `1-Run File Server.bat`. It prompts for:
+Check configuration:
+
+```powershell
+npm run doctor
+```
+
+## Security and publishing
+
+Do not commit local secrets or generated artifacts. These are ignored by Git:
 
 ```text
-Enter MCP local token:
+.env
+.mcp-local-token
+.mcp-server-port
+keys.bat
+keys.txt
+tunnel-client.exe
+dist/
+node_modules/
 ```
 
-Or create a local `.env` file from `.env.example` and set:
+Delete `keys.bat` if you want to reset saved local credentials. If an API key
+has ever been committed, pasted into an issue, shared in logs, or exposed in a
+terminal transcript, revoke it and create a new one.
+
+Raw write access is intentionally disabled unless you set:
 
 ```env
-MCP_LOCAL_TOKEN=your-long-random-secret
+ALLOW_RAW_WRITE_ANY_FILE=I_UNDERSTAND_THIS_CAN_DESTROY_FILES
 ```
 
-Do not commit `.env`, `.mcp-local-token`, `.mcp-server-port`, `keys.bat`,
-`keys.txt`, `tunnel-client.exe`, `dist/`, or `node_modules/`. These files and
-folders can include sensitive local data, personal keys, saved tokens, or
-machine-specific build output.
+Leave raw writes disabled unless you understand the risk.
