@@ -13,7 +13,7 @@ echo.
 echo === OpenAI Tunnel Client - STDIO MCP ===
 echo.
 echo This launches the local MCP server through STDIO instead of HTTP.
-echo You do not need to run 1-Run File Server.bat for this mode.
+echo You do not need to start a separate HTTP file server for this mode.
 echo.
 
 set "KEYS_FILE=%~dp0keys.bat"

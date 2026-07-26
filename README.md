@@ -13,8 +13,8 @@ ChatGPT can connect to this MCP server in three ways:
 
 - **ChatGPT Chat, fastest path:** Secure MCP Tunnel -> tunnel client -> local
   STDIO server.
-- **ChatGPT Chat, HTTP path:** Secure MCP Tunnel -> tunnel client -> local HTTP
-  server at `http://127.0.0.1:3333/mcp`.
+- **ChatGPT Chat, manual HTTP path:** Secure MCP Tunnel -> tunnel client ->
+  local HTTP server at `http://127.0.0.1:3333/mcp`.
 - **ChatGPT Desktop / Codex:** local STDIO server directly, with no tunnel.
 
 For regular ChatGPT Chat, the fastest supported path is still through a Secure
@@ -32,7 +32,7 @@ The local HTTP server is optional when you use the STDIO tunnel launcher.
 - Optional but recommended:
   [ripgrep](https://github.com/BurntSushi/ripgrep) for fast search
 
-Put `start-tunnel.exe` in the project root. The batch launchers copy it to
+Put `start-tunnel.exe` in the project root. The STDIO launcher copies it to
 `tunnel-client.exe` automatically when needed.
 
 ## Install and build
@@ -98,7 +98,7 @@ ChatGPT Chat -> Secure MCP Tunnel -> tunnel-client -> node dist/src/stdio.js
 Run:
 
 ```powershell
-.\2-Run Tunnel Client STDIO.bat
+& ".\Run Tunnel Client STDIO.bat"
 ```
 
 The script prompts for your OpenAI API key and tunnel ID, saves them locally in
@@ -109,13 +109,13 @@ client with:
 --mcp.command "command=node dist/src/stdio.js,channel=main"
 ```
 
-You do not need to run `1-Run File Server.bat` in this mode.
+You do not need to start the local HTTP server in this mode.
 
 In ChatGPT Chat, add or manage the developer-mode MCP app from
 [chatgpt.com/plugins](https://chatgpt.com/plugins) or ChatGPT settings, choose
 Tunnel as the connection type, and select or paste the same tunnel ID.
 
-## ChatGPT Chat: HTTP tunnel
+## ChatGPT Chat: manual HTTP tunnel
 
 Use this path if you specifically want the local HTTP MCP server:
 
@@ -126,17 +126,19 @@ ChatGPT Chat -> Secure MCP Tunnel -> tunnel-client -> http://127.0.0.1:3333/mcp
 Start the file server:
 
 ```powershell
-.\1-Run File Server.bat
+npm run start:http
 ```
 
-Then start the tunnel client in a second terminal:
+Then start `tunnel-client.exe` in a second terminal and point it at the local
+HTTP endpoint:
 
 ```powershell
-.\2-Run Tunnel Client.bat
+.\tunnel-client.exe run --control-plane.api-key "env:CONTROL_PLANE_API_KEY" --control-plane.tunnel-id "your-tunnel-id" --mcp.server-url "url=http://127.0.0.1:3333/mcp,channel=main" --mcp.extra-headers "Authorization: Bearer your-mcp-local-token"
 ```
 
-Both scripts use the same `MCP_LOCAL_TOKEN`. The token is a secret value you
-create yourself; it is not supplied by OpenAI.
+Set `CONTROL_PLANE_API_KEY` first, or replace the `env:CONTROL_PLANE_API_KEY`
+reference with another supported secret reference. The `MCP_LOCAL_TOKEN` value
+is a secret you create yourself; it is not supplied by OpenAI.
 
 ## ChatGPT Desktop / Codex
 
