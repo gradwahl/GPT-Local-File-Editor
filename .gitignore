@@ -1,11 +1,20 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 .mcp-local-token
 .mcp-server-port
 keys.bat
 keys.txt
+*.key
+*.pem
+*.p12
+*.pfx
 tunnel-client.exe
+start-tunnel.exe
 New Text Document.txt
 *.log
+*.tgz
+*.zip
 .DS_Store
