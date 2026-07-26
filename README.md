@@ -9,17 +9,10 @@ guarded by environment variables.
 This repository is source-only. Users install dependencies and build `dist/`
 locally.
 
-ChatGPT can connect to this MCP server in three ways:
+The way ChatGPT connects to this MCP server
 
 - **ChatGPT Chat, fastest path:** Secure MCP Tunnel -> tunnel client -> local
   STDIO server.
-- **ChatGPT Chat, manual HTTP path:** Secure MCP Tunnel -> tunnel client ->
-  local HTTP server at `http://127.0.0.1:3333/mcp`.
-- **ChatGPT Desktop / Codex:** local STDIO server directly, with no tunnel.
-
-For regular ChatGPT Chat, the fastest supported path is still through a Secure
-MCP Tunnel because ChatGPT Chat cannot start a local STDIO process directly.
-The local HTTP server is optional when you use the STDIO tunnel launcher.
 
 ## Prerequisites
 
