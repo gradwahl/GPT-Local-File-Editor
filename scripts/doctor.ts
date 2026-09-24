@@ -64,6 +64,7 @@ async function main(): Promise<void> {
   const sessionTtlMs = Number.parseInt(process.env.MCP_SESSION_TTL_MS || "1800000", 10);
   const searchIndexCacheTtlMs = Number.parseInt(process.env.SEARCH_INDEX_CACHE_TTL_MS || "300000", 10);
   const searchConcurrency = Number.parseInt(process.env.SEARCH_CONCURRENCY || "16", 10);
+  const commandMaxOutputBytes = Number.parseInt(process.env.COMMAND_MAX_OUTPUT_BYTES || "65536", 10);
 
   await fs.mkdir(workspace.path, { recursive: true });
   await fs.mkdir(path.join(home, "backups"), { recursive: true });
@@ -85,6 +86,7 @@ async function main(): Promise<void> {
   console.log(`Search index uses rg --files: ${envBool("SEARCH_USE_RIPGREP_FILES", envBool("SEARCH_USE_RIPGREP", true))}`);
   console.log(`Search index cache TTL ms: ${Number.isFinite(searchIndexCacheTtlMs) ? searchIndexCacheTtlMs : 300000}`);
   console.log(`Search concurrency: ${Number.isFinite(searchConcurrency) ? searchConcurrency : 16}`);
+  console.log(`Command max output bytes per stream: ${Number.isFinite(commandMaxOutputBytes) ? commandMaxOutputBytes : 65536}`);
   console.log(`Default write backups: ${envBool("WRITE_CREATE_BACKUP_DEFAULT", true)}`);
   console.log(`Write SHA-256 hashes: ${envBool("WRITE_COMPUTE_SHA256", true)}`);
 

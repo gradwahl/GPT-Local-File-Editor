@@ -228,6 +228,14 @@ async function workspaceRoot(): Promise<string> {
   return await fs.realpath(configured);
 }
 
+export async function getActiveWorkspaceRoot(): Promise<string> {
+  return await workspaceRoot();
+}
+
+export async function resolveWorkspacePath(relativeOrSubpath: string): Promise<string> {
+  return await resolveInsideWorkspace(relativeOrSubpath || ".");
+}
+
 async function setActiveWorkspace(inputPath: string): Promise<string> {
   const target = abs(inputPath);
   await fs.mkdir(target, { recursive: true });
