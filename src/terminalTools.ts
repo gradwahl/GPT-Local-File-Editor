@@ -60,6 +60,41 @@ export type CommandResult = {
 };
 
 type ProcessStatus = "running" | "stopping" | "exited" | "failed";
+type ProcessStream = "stdout" | "stderr";
+type PromptDetectionMode = "auto" | "on" | "off";
+type ProcessWaitReason = "immediate" | "output_available" | "prompt_detected" | "process_finished" | "timeout";
+
+type PromptDetection = {
+  kind: string;
+  text: string;
+  stream: ProcessStream;
+  detectedAt: number;
+};
+
+type ProcessTimelineEvent = {
+  atMs: number;
+  type: "spawned" | "stdout" | "stderr" | "prompt" | "stdin" | "stdin_closed" | "stop_requested" | "exit" | "error";
+  stream?: ProcessStream;
+  bytes?: number;
+  detail?: string;
+};
+
+type ProcessTelemetry = {
+  spawnRequestedAt: number;
+  spawnedAt: number;
+  firstOutputAt: number | null;
+  lastOutputAt: number | null;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutEvents: number;
+  stderrEvents: number;
+  stdinBytes: number;
+  stdinWrites: number;
+  readCalls: number;
+  totalReadWaitMs: number;
+  promptDetections: number;
+  timeline: ProcessTimelineEvent[];
+};
 
 type ManagedProcess = {
   id: string;
@@ -77,6 +112,12 @@ type ManagedProcess = {
   stopRequestedAt: number | null;
   stdout: UnreadBuffer;
   stderr: UnreadBuffer;
+  promptDetector: ReplPromptDetector;
+  promptProfile: string;
+  replLikely: boolean;
+  lastPrompt: PromptDetection | null;
+  lastReadPromptCount: number;
+  telemetry: ProcessTelemetry;
 };
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
@@ -100,6 +141,7 @@ const MAX_MANAGED_PROCESSES = 100;
 const MAX_PROCESS_READ_WAIT_MS = 30_000;
 const DEFAULT_STOP_GRACE_MS = 3_000;
 const MAX_STOP_GRACE_MS = 30_000;
+const MAX_PROCESS_TIMELINE_EVENTS = 100;
 
 const processes = new Map<string, ManagedProcess>();
 
@@ -205,6 +247,127 @@ class AnsiStripper {
     }
 
     return output.subarray(0, outputLength);
+  }
+}
+
+type PromptProfile = {
+  name: string;
+  replLikely: boolean;
+  patterns: Array<{ kind: string; regex: RegExp }>;
+};
+
+const COMMON_PROMPT_PATTERNS: Array<{ kind: string; regex: RegExp }> = [
+  { kind: "python", regex: /(?:^|\r?\n)>>> $/ },
+  { kind: "python_continuation", regex: /(?:^|\r?\n)\.\.\. $/ },
+  { kind: "ipython", regex: /(?:^|\r?\n)In \[\d+\]: $/ },
+  { kind: "julia", regex: /(?:^|\r?\n)julia> $/ },
+  { kind: "sqlite", regex: /(?:^|\r?\n)(?:sqlite|   \.\.\.)> $/ },
+  { kind: "mysql", regex: /(?:^|\r?\n)mysql> $/ },
+  { kind: "postgres", regex: /(?:^|\r?\n)[A-Za-z0-9_.-]+[=#-]> $/ },
+  { kind: "ghci", regex: /(?:^|\r?\n)(?:Prelude|ghci|\*?[A-Za-z0-9_.]+)> $/ },
+  { kind: "powershell", regex: /(?:^|\r?\n)PS [^\r\n]{0,240}> $/ },
+  { kind: "cmd", regex: /(?:^|\r?\n)[A-Za-z]:\\[^\r\n>]{0,240}> ?$/ },
+  { kind: "irb", regex: /(?:^|\r?\n)irb(?:\([^)]*\))?:[^\r\n>]{0,80}> $/ },
+  { kind: "generic_angle", regex: /(?:^|\r?\n)> $/ },
+  { kind: "shell", regex: /(?:^|\r?\n)[^\r\n]{0,240}[$#%] $/ },
+];
+
+function commandBasename(command: string): string {
+  return path.basename(command).toLowerCase().replace(/\.(?:exe|cmd|bat)$/i, "");
+}
+
+function promptProfileFor(command: string, args: string[]): PromptProfile {
+  const base = commandBasename(command);
+  const has = (...values: string[]): boolean => args.some((arg) => values.includes(arg.toLowerCase()));
+
+  if (["python", "python3", "py"].includes(base)) {
+    return { name: "python", replLikely: has("-i", "--interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  }
+  if (["ipython", "ipython3"].includes(base)) {
+    return { name: "ipython", replLikely: true, patterns: COMMON_PROMPT_PATTERNS };
+  }
+  if (base === "node") {
+    return { name: "node", replLikely: has("-i", "--interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  }
+  if (["r", "rterm"].includes(base)) return { name: "r", replLikely: has("--interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  if (base === "julia") return { name: "julia", replLikely: has("-i", "--interactive=yes"), patterns: COMMON_PROMPT_PATTERNS };
+  if (base === "sqlite3") return { name: "sqlite", replLikely: has("-interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  if (["mysql", "psql", "ghci", "irb"].includes(base)) return { name: base, replLikely: true, patterns: COMMON_PROMPT_PATTERNS };
+  if (base === "php") return { name: "php", replLikely: has("-a", "--interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  if (["bash", "zsh", "sh", "fish"].includes(base)) {
+    return { name: base, replLikely: has("-i", "--interactive"), patterns: COMMON_PROMPT_PATTERNS };
+  }
+  if (["pwsh", "powershell"].includes(base)) {
+    return { name: base, replLikely: has("-noexit"), patterns: COMMON_PROMPT_PATTERNS };
+  }
+  if (base === "cmd") {
+    return { name: base, replLikely: has("/k"), patterns: COMMON_PROMPT_PATTERNS };
+  }
+  return { name: "generic", replLikely: false, patterns: COMMON_PROMPT_PATTERNS };
+}
+
+class ReplPromptDetector {
+  private readonly stdoutStripper = new AnsiStripper();
+  private readonly stderrStripper = new AnsiStripper();
+  private stdoutTail = "";
+  private stderrTail = "";
+
+  constructor(private readonly profile: PromptProfile) {}
+
+  push(stream: ProcessStream, chunk: Buffer | string, detectedAt = Date.now()): PromptDetection | null {
+    const stripper = stream === "stdout" ? this.stdoutStripper : this.stderrStripper;
+    const clean = stripper.push(chunk).toString("utf8");
+    if (!clean) return null;
+
+    if (stream === "stdout") this.stdoutTail = (this.stdoutTail + clean).slice(-4096);
+    else this.stderrTail = (this.stderrTail + clean).slice(-4096);
+
+    const tail = stream === "stdout" ? this.stdoutTail : this.stderrTail;
+    // Check the rolling tail first so prompts split across chunks are reconstructed.
+    // The tail is reset after a detection, which also lets successive CPython
+    // prompts (written without a newline on stderr) be detected independently.
+    for (const candidate of clean === tail ? [tail] : [tail, clean]) {
+      for (const pattern of this.profile.patterns) {
+        const match = pattern.regex.exec(candidate);
+        if (!match) continue;
+        const text = match[0].replace(/^\r?\n/, "");
+        if (stream === "stdout") this.stdoutTail = "";
+        else this.stderrTail = "";
+        return { kind: pattern.kind, text, stream, detectedAt };
+      }
+    }
+    return null;
+  }
+}
+
+function pushTimelineEvent(proc: ManagedProcess, event: Omit<ProcessTimelineEvent, "atMs">, at = Date.now()): void {
+  proc.telemetry.timeline.push({ atMs: Math.max(0, at - proc.startedAt), ...event });
+  if (proc.telemetry.timeline.length > MAX_PROCESS_TIMELINE_EVENTS) {
+    proc.telemetry.timeline.splice(0, proc.telemetry.timeline.length - MAX_PROCESS_TIMELINE_EVENTS);
+  }
+}
+
+function recordProcessOutput(proc: ManagedProcess, stream: ProcessStream, chunk: Buffer): void {
+  const at = Date.now();
+  const bytes = chunk.length;
+  if (proc.telemetry.firstOutputAt === null) proc.telemetry.firstOutputAt = at;
+  proc.telemetry.lastOutputAt = at;
+  if (stream === "stdout") {
+    proc.telemetry.stdoutBytes += bytes;
+    proc.telemetry.stdoutEvents += 1;
+    proc.stdout.push(chunk);
+  } else {
+    proc.telemetry.stderrBytes += bytes;
+    proc.telemetry.stderrEvents += 1;
+    proc.stderr.push(chunk);
+  }
+  pushTimelineEvent(proc, { type: stream, stream, bytes }, at);
+
+  const prompt = proc.promptDetector.push(stream, chunk, at);
+  if (prompt) {
+    proc.lastPrompt = prompt;
+    proc.telemetry.promptDetections += 1;
+    pushTimelineEvent(proc, { type: "prompt", stream, detail: `${prompt.kind}: ${prompt.text}` }, at);
   }
 }
 
@@ -539,7 +702,27 @@ export async function runWorkspaceCommand(options: RunCommandOptions): Promise<C
   });
 }
 
-function processSummary(proc: ManagedProcess): Record<string, unknown> {
+function processTelemetrySummary(proc: ManagedProcess): Record<string, unknown> {
+  const now = Date.now();
+  return {
+    spawnLatencyMs: Math.max(0, proc.telemetry.spawnedAt - proc.telemetry.spawnRequestedAt),
+    uptimeMs: Math.max(0, (proc.exitedAt ?? now) - proc.startedAt),
+    timeToFirstOutputMs: proc.telemetry.firstOutputAt === null ? null : Math.max(0, proc.telemetry.firstOutputAt - proc.startedAt),
+    timeSinceLastOutputMs: proc.telemetry.lastOutputAt === null ? null : Math.max(0, now - proc.telemetry.lastOutputAt),
+    stdoutBytes: proc.telemetry.stdoutBytes,
+    stderrBytes: proc.telemetry.stderrBytes,
+    stdoutEvents: proc.telemetry.stdoutEvents,
+    stderrEvents: proc.telemetry.stderrEvents,
+    stdinBytes: proc.telemetry.stdinBytes,
+    stdinWrites: proc.telemetry.stdinWrites,
+    readCalls: proc.telemetry.readCalls,
+    totalReadWaitMs: proc.telemetry.totalReadWaitMs,
+    promptDetections: proc.telemetry.promptDetections,
+    timeline: proc.telemetry.timeline,
+  };
+}
+
+function processSummary(proc: ManagedProcess, includeTelemetry = false): Record<string, unknown> {
   return {
     process_id: proc.id,
     pid: proc.child.pid ?? null,
@@ -558,6 +741,18 @@ function processSummary(proc: ManagedProcess): Record<string, unknown> {
     stderrUnreadBytes: proc.stderr.unreadBytes,
     stdoutDroppedBytes: proc.stdout.dropped,
     stderrDroppedBytes: proc.stderr.dropped,
+    promptProfile: proc.promptProfile,
+    replLikely: proc.replLikely,
+    lastPrompt: proc.lastPrompt
+      ? {
+          kind: proc.lastPrompt.kind,
+          text: proc.lastPrompt.text,
+          stream: proc.lastPrompt.stream,
+          detectedAt: new Date(proc.lastPrompt.detectedAt).toISOString(),
+          detectedAtMs: Math.max(0, proc.lastPrompt.detectedAt - proc.startedAt),
+        }
+      : null,
+    ...(includeTelemetry ? { telemetry: processTelemetrySummary(proc) } : {}),
   };
 }
 
@@ -585,12 +780,24 @@ async function waitForManagedProcessExit(proc: ManagedProcess, timeoutMs: number
   });
 }
 
-async function waitForProcessOutput(proc: ManagedProcess, timeoutMs: number): Promise<void> {
-  if (timeoutMs <= 0 || proc.stdout.unreadBytes > 0 || proc.stderr.unreadBytes > 0 || !processIsActive(proc)) return;
+async function waitForProcessOutput(
+  proc: ManagedProcess,
+  timeoutMs: number,
+  promptDetection: PromptDetectionMode
+): Promise<{ reason: ProcessWaitReason; durationMs: number; promptWaitActive: boolean }> {
+  const startedAt = Date.now();
+  const promptWaitActive = promptDetection === "on" || (promptDetection === "auto" && proc.replLikely);
+  const hasUnreadOutput = proc.stdout.unreadBytes > 0 || proc.stderr.unreadBytes > 0;
+  const hasUnreadPrompt = proc.telemetry.promptDetections > proc.lastReadPromptCount;
 
-  await new Promise<void>((resolve) => {
+  if (timeoutMs <= 0) return { reason: "immediate", durationMs: 0, promptWaitActive };
+  if (!processIsActive(proc)) return { reason: "process_finished", durationMs: 0, promptWaitActive };
+  if (hasUnreadPrompt && promptWaitActive) return { reason: "prompt_detected", durationMs: 0, promptWaitActive };
+  if (hasUnreadOutput && !promptWaitActive) return { reason: "output_available", durationMs: 0, promptWaitActive };
+
+  return await new Promise((resolve) => {
     let settled = false;
-    const finish = (): void => {
+    const finish = (reason: ProcessWaitReason): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -598,14 +805,22 @@ async function waitForProcessOutput(proc: ManagedProcess, timeoutMs: number): Pr
       proc.child.stderr.off("data", onData);
       proc.child.off("close", onClose);
       proc.child.off("error", onClose);
-      resolve();
+      resolve({ reason, durationMs: Date.now() - startedAt, promptWaitActive });
     };
-    const onData = (): void => finish();
-    const onClose = (): void => finish();
-    const timer = setTimeout(finish, timeoutMs);
+    const onData = (): void => {
+      // Permanent output listeners were attached before this waiter, so prompt
+      // detection has already processed the chunk when this callback runs.
+      if (promptWaitActive) {
+        if (proc.telemetry.promptDetections > proc.lastReadPromptCount) finish("prompt_detected");
+      } else {
+        finish("output_available");
+      }
+    };
+    const onClose = (): void => finish("process_finished");
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
     timer.unref();
-    proc.child.stdout.once("data", onData);
-    proc.child.stderr.once("data", onData);
+    proc.child.stdout.on("data", onData);
+    proc.child.stderr.on("data", onData);
     proc.child.once("close", onClose);
     proc.child.once("error", onClose);
   });
@@ -638,15 +853,18 @@ async function startManagedProcess(options: {
 
   const command = validateCommand(options.command);
   const cwd = await resolveCommandCwd(options.cwd);
+  const spawnRequestedAt = Date.now();
   const child = spawnProcess(command, options.args, cwd, childEnvironment(options.env, cwd));
+  const profile = promptProfileFor(command, options.args);
   const id = `proc_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const startedAt = Date.now();
   const proc: ManagedProcess = {
     id,
     child,
     command,
     args: options.args,
     cwd,
-    startedAt: Date.now(),
+    startedAt,
     exitedAt: null,
     exitCode: null,
     signal: null,
@@ -656,23 +874,50 @@ async function startManagedProcess(options: {
     stopRequestedAt: null,
     stdout: new UnreadBuffer(options.maxBufferBytes),
     stderr: new UnreadBuffer(options.maxBufferBytes),
+    promptDetector: new ReplPromptDetector(profile),
+    promptProfile: profile.name,
+    replLikely: profile.replLikely,
+    lastPrompt: null,
+    lastReadPromptCount: 0,
+    telemetry: {
+      spawnRequestedAt,
+      spawnedAt: startedAt,
+      firstOutputAt: null,
+      lastOutputAt: null,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      stdoutEvents: 0,
+      stderrEvents: 0,
+      stdinBytes: 0,
+      stdinWrites: 0,
+      readCalls: 0,
+      totalReadWaitMs: 0,
+      promptDetections: 0,
+      timeline: [],
+    },
   };
 
-  child.stdout.on("data", (chunk: Buffer) => proc.stdout.push(chunk));
-  child.stderr.on("data", (chunk: Buffer) => proc.stderr.push(chunk));
+  child.stdout.on("data", (chunk: Buffer) => recordProcessOutput(proc, "stdout", chunk));
+  child.stderr.on("data", (chunk: Buffer) => recordProcessOutput(proc, "stderr", chunk));
   child.once("error", (err) => {
+    const at = Date.now();
     proc.error = err.message;
     proc.status = "failed";
-    proc.exitedAt = Date.now();
+    proc.exitedAt = at;
+    pushTimelineEvent(proc, { type: "error", detail: err.message }, at);
   });
   child.once("close", (code, signal) => {
+    const at = Date.now();
     proc.exitCode = code;
     proc.signal = signal;
     proc.status = proc.error ? "failed" : "exited";
-    proc.exitedAt = Date.now();
+    proc.exitedAt = at;
+    pushTimelineEvent(proc, { type: "exit", detail: `code=${code ?? "null"} signal=${signal ?? "null"}` }, at);
   });
   child.stdin.once("finish", () => {
+    const at = Date.now();
     proc.stdinClosed = true;
+    pushTimelineEvent(proc, { type: "stdin_closed" }, at);
   });
 
   // Do not hand out a process_id until the executable has actually spawned.
@@ -681,6 +926,9 @@ async function startManagedProcess(options: {
   await new Promise<void>((resolve, reject) => {
     const onSpawn = (): void => {
       child.off("error", onInitialError);
+      const at = Date.now();
+      proc.telemetry.spawnedAt = at;
+      pushTimelineEvent(proc, { type: "spawned", detail: `pid=${child.pid ?? "unknown"}` }, at);
       resolve();
     };
     const onInitialError = (err: Error): void => {
@@ -693,7 +941,13 @@ async function startManagedProcess(options: {
 
   processes.set(id, proc);
 
-  if (options.stdin !== undefined) child.stdin.write(options.stdin);
+  if (options.stdin !== undefined) {
+    child.stdin.write(options.stdin);
+    const bytes = Buffer.byteLength(options.stdin);
+    proc.telemetry.stdinBytes += bytes;
+    proc.telemetry.stdinWrites += 1;
+    pushTimelineEvent(proc, { type: "stdin", bytes, detail: "initial stdin" });
+  }
   return proc;
 }
 
@@ -873,7 +1127,7 @@ export function registerTerminalTools(server: McpServer): void {
     {
       title: "Start background process",
       description:
-        "Starts a long-running process such as a dev server or watcher. Returns a process_id for read_process/write_process/stop_process. cwd is workspace-relative; the process is not sandboxed.",
+        "Starts a long-running process such as a dev server, watcher, shell, or REPL. Returns a process_id for read_process/write_process/stop_process. Interactive commands are classified for automatic prompt detection. verbose_timing includes spawn/process telemetry. cwd is workspace-relative; the process is not sandboxed.",
       inputSchema: {
         command: z.string(),
         args: argsSchema,
@@ -881,10 +1135,11 @@ export function registerTerminalTools(server: McpServer): void {
         env: envSchema,
         stdin: z.string().optional(),
         max_buffer_bytes: z.number().int().min(4096).max(MAX_PROCESS_BUFFER_BYTES).default(DEFAULT_PROCESS_BUFFER_BYTES),
+        verbose_timing: z.boolean().default(false),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ command, args = [], cwd = ".", env = {}, stdin, max_buffer_bytes = DEFAULT_PROCESS_BUFFER_BYTES }) => {
+    async ({ command, args = [], cwd = ".", env = {}, stdin, max_buffer_bytes = DEFAULT_PROCESS_BUFFER_BYTES, verbose_timing = false }) => {
       try {
         const proc = await startManagedProcess({
           command,
@@ -894,7 +1149,7 @@ export function registerTerminalTools(server: McpServer): void {
           stdin,
           maxBufferBytes: max_buffer_bytes,
         });
-        return ok({ ok: true, ...processSummary(proc) });
+        return ok({ ok: true, ...processSummary(proc, verbose_timing) });
       } catch (err: unknown) {
         return fail((err as Error).message);
       }
@@ -906,24 +1161,42 @@ export function registerTerminalTools(server: McpServer): void {
     {
       title: "Read background process output",
       description:
-        "Reads and consumes only new stdout/stderr buffered since previous reads for a managed process. wait_ms can briefly wait for fresh output or process exit, reducing repeated polling MCP calls.",
+        "Reads and consumes only new stdout/stderr buffered since previous reads. wait_ms can wait for fresh output, process exit, or a detected REPL prompt. prompt_detection=auto waits for prompts only when the launched command looks like an interactive REPL/shell; on forces prompt-aware waiting and off preserves first-output waiting. verbose_timing adds detailed latency/counter/timeline telemetry.",
       inputSchema: {
         process_id: z.string(),
         max_bytes_per_stream: z.number().int().min(1).max(MAX_PROCESS_BUFFER_BYTES).default(DEFAULT_PROCESS_READ_BYTES),
         wait_ms: z.number().int().min(0).max(MAX_PROCESS_READ_WAIT_MS).default(0),
+        prompt_detection: z.enum(["auto", "on", "off"]).default("auto"),
+        verbose_timing: z.boolean().default(false),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ process_id, max_bytes_per_stream = DEFAULT_PROCESS_READ_BYTES, wait_ms = 0 }) => {
+    async ({
+      process_id,
+      max_bytes_per_stream = DEFAULT_PROCESS_READ_BYTES,
+      wait_ms = 0,
+      prompt_detection = "auto",
+      verbose_timing = false,
+    }) => {
       const proc = processes.get(process_id);
       if (!proc) return fail(`Unknown process_id: ${process_id}`);
 
-      await waitForProcessOutput(proc, wait_ms);
+      const callStartedAt = Date.now();
+      const promptCountBefore = proc.lastReadPromptCount;
+      const wait = await waitForProcessOutput(proc, wait_ms, prompt_detection);
+      proc.telemetry.readCalls += 1;
+      proc.telemetry.totalReadWaitMs += wait.durationMs;
+
       const stdout = proc.stdout.drain(max_bytes_per_stream);
       const stderr = proc.stderr.drain(max_bytes_per_stream);
+      const promptCountAfter = proc.telemetry.promptDetections;
+      const promptsDetected = Math.max(0, promptCountAfter - promptCountBefore);
+      proc.lastReadPromptCount = promptCountAfter;
+      const callDurationMs = Date.now() - callStartedAt;
+
       return ok({
         ok: true,
-        ...processSummary(proc),
+        ...processSummary(proc, verbose_timing),
         stdout: stdout.text,
         stderr: stderr.text,
         stdoutReadBytes: stdout.bytes,
@@ -933,6 +1206,23 @@ export function registerTerminalTools(server: McpServer): void {
         stdoutDroppedBeforeRead: stdout.droppedBytes,
         stderrDroppedBeforeRead: stderr.droppedBytes,
         hasMoreOutput: stdout.remainingBytes > 0 || stderr.remainingBytes > 0,
+        promptDetectionMode: prompt_detection,
+        promptWaitActive: wait.promptWaitActive,
+        promptDetected: promptsDetected > 0,
+        promptsDetected,
+        waitReason: wait.reason,
+        ...(verbose_timing
+          ? {
+              readTiming: {
+                durationMs: callDurationMs,
+                waitRequestedMs: wait_ms,
+                waitDurationMs: wait.durationMs,
+                exitReason: wait.reason,
+                promptDetectionMode: prompt_detection,
+                promptWaitActive: wait.promptWaitActive,
+              },
+            }
+          : {}),
       });
     }
   );
@@ -941,28 +1231,45 @@ export function registerTerminalTools(server: McpServer): void {
     "write_process",
     {
       title: "Write to background process",
-      description: "Writes text to stdin of a running managed process. Optionally closes stdin after writing.",
+      description: "Writes text to stdin of a running managed process. Optionally closes stdin after writing. verbose_timing reports write latency and cumulative process telemetry.",
       inputSchema: {
         process_id: z.string(),
         data: z.string(),
         end: z.boolean().default(false),
+        verbose_timing: z.boolean().default(false),
       },
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ process_id, data, end = false }) => {
+    async ({ process_id, data, end = false, verbose_timing = false }) => {
       const proc = processes.get(process_id);
       if (!proc) return fail(`Unknown process_id: ${process_id}`);
-      if (proc.status !== "running") return fail(`Process ${process_id} is not running.`, processSummary(proc));
+      if (proc.status !== "running") return fail(`Process ${process_id} is not running.`, processSummary(proc, verbose_timing));
       if (!proc.child.stdin.writable) return fail(`stdin is not writable for process ${process_id}.`);
 
+      const writeStartedAt = Date.now();
       try {
         await new Promise<void>((resolve, reject) => {
           const callback = (err?: Error | null): void => (err ? reject(err) : resolve());
           if (end) proc.child.stdin.end(data, callback);
           else proc.child.stdin.write(data, callback);
         });
+        const bytesWritten = Buffer.byteLength(data);
+        proc.telemetry.stdinBytes += bytesWritten;
+        proc.telemetry.stdinWrites += 1;
+        pushTimelineEvent(proc, { type: "stdin", bytes: bytesWritten, detail: end ? "write + end" : "write" });
         if (end) proc.stdinClosed = true;
-        return ok({ ok: true, process_id, bytesWritten: Buffer.byteLength(data), stdinEnded: end });
+        return ok({
+          ok: true,
+          process_id,
+          bytesWritten,
+          stdinEnded: end,
+          ...(verbose_timing
+            ? {
+                writeTiming: { durationMs: Date.now() - writeStartedAt },
+                telemetry: processTelemetrySummary(proc),
+              }
+            : {}),
+        });
       } catch (err: unknown) {
         return fail((err as Error).message);
       }
@@ -973,22 +1280,25 @@ export function registerTerminalTools(server: McpServer): void {
     "stop_process",
     {
       title: "Stop background process",
-      description: "Stops a managed process and its child process tree when possible.",
+      description: "Stops a managed process and its child process tree when possible. verbose_timing reports stop latency and cumulative process telemetry.",
       inputSchema: {
         process_id: z.string(),
         grace_ms: z.number().int().min(0).max(MAX_STOP_GRACE_MS).default(DEFAULT_STOP_GRACE_MS),
         force: z.boolean().default(true),
+        verbose_timing: z.boolean().default(false),
       },
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ process_id, grace_ms = DEFAULT_STOP_GRACE_MS, force = true }) => {
+    async ({ process_id, grace_ms = DEFAULT_STOP_GRACE_MS, force = true, verbose_timing = false }) => {
       const proc = processes.get(process_id);
       if (!proc) return fail(`Unknown process_id: ${process_id}`);
-      if (!processIsActive(proc)) return ok({ ok: true, alreadyStopped: true, ...processSummary(proc) });
+      if (!processIsActive(proc)) return ok({ ok: true, alreadyStopped: true, ...processSummary(proc, verbose_timing) });
 
+      const stopStartedAt = Date.now();
       try {
         proc.status = "stopping";
         proc.stopRequestedAt = Date.now();
+        pushTimelineEvent(proc, { type: "stop_requested", detail: `grace_ms=${grace_ms} force=${force}` }, proc.stopRequestedAt);
         await signalProcessTree(proc.child, false);
         let exited = await waitForManagedProcessExit(proc, grace_ms);
         let forced = false;
@@ -1001,10 +1311,11 @@ export function registerTerminalTools(server: McpServer): void {
           ok: exited,
           stopRequested: true,
           forced,
-          ...processSummary(proc),
+          ...processSummary(proc, verbose_timing),
+          ...(verbose_timing ? { stopTiming: { durationMs: Date.now() - stopStartedAt, graceMs: grace_ms, forced } } : {}),
         });
       } catch (err: unknown) {
-        return fail((err as Error).message, processSummary(proc));
+        return fail((err as Error).message, processSummary(proc, verbose_timing));
       }
     }
   );
@@ -1013,17 +1324,18 @@ export function registerTerminalTools(server: McpServer): void {
     "list_processes",
     {
       title: "List background processes",
-      description: "Lists processes started through start_process, including running/exited status and unread output sizes.",
+      description: "Lists processes started through start_process, including running/exited status, unread output sizes, prompt state, and optional verbose timing telemetry.",
       inputSchema: {
         include_exited: z.boolean().default(true),
+        verbose_timing: z.boolean().default(false),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ include_exited = true }) => {
+    async ({ include_exited = true, verbose_timing = false }) => {
       const all = [...processes.values()]
         .filter((proc) => include_exited || processIsActive(proc))
         .sort((a, b) => b.startedAt - a.startedAt)
-        .map(processSummary);
+        .map((proc) => processSummary(proc, verbose_timing));
       return ok({ ok: true, count: all.length, workspaceRoot: await getActiveWorkspaceRoot(), processes: all });
     }
   );
