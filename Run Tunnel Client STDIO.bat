@@ -44,20 +44,22 @@ if "%CONTROL_PLANE_TUNNEL_ID%"=="" (
   exit /b 1
 )
 
-if not exist "dist\src\stdio.js" (
-  echo Build output is missing. Installing dependencies and building...
+if not exist "node_modules\.package-lock.json" (
+  echo Dependencies are missing. Installing...
   call npm install
   if errorlevel 1 (
     echo npm install failed.
     pause
     exit /b 1
   )
-  call npm run build
-  if errorlevel 1 (
-    echo npm run build failed.
-    pause
-    exit /b 1
-  )
+)
+
+echo Building the latest MCP server so the exposed tool schema is current...
+call npm run build
+if errorlevel 1 (
+  echo npm run build failed.
+  pause
+  exit /b 1
 )
 
 if not exist "%TUNNEL_CLIENT%" (

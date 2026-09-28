@@ -1001,6 +1001,52 @@ export function registerTerminalTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "run_windows_command",
+    {
+      title: "Run Windows CMD command",
+      description:
+        "Runs a Windows command line through cmd.exe and waits for completion. Use this for .bat/.cmd files, CMD built-ins such as dir/copy/del/type/set, and shell syntax such as &&, ||, pipes, and redirection. command_line is interpreted by cmd.exe, so quote paths/arguments as normal Windows CMD syntax. cwd must be relative to the active workspace. The command is not sandboxed and runs with the MCP process user's OS permissions.",
+      inputSchema: {
+        command_line: z.string(),
+        cwd: z.string().default("."),
+        env: envSchema,
+        stdin: z.string().optional(),
+        timeout_ms: z.number().int().min(1).max(MAX_COMMAND_TIMEOUT_MS).default(DEFAULT_COMMAND_TIMEOUT_MS),
+        max_output_bytes: z.number().int().min(1024).max(MAX_COMMAND_OUTPUT_BYTES).default(defaultCommandOutputBytes()),
+      },
+      annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ command_line, cwd = ".", env = {}, stdin, timeout_ms = DEFAULT_COMMAND_TIMEOUT_MS, max_output_bytes = defaultCommandOutputBytes() }) => {
+      try {
+        if (process.platform !== "win32") {
+          return fail("run_windows_command is only available when the MCP server is running on Windows.");
+        }
+        const commandLine = command_line.trim();
+        if (!commandLine) return fail("command_line must not be empty.");
+        if (commandLine.includes("\0")) return fail("command_line contains an invalid NUL byte.");
+
+        const comspec = process.env.ComSpec?.trim() || "cmd.exe";
+        const result = await runWorkspaceCommand({
+          command: comspec,
+          args: ["/d", "/s", "/c", commandLine],
+          cwd,
+          env,
+          stdin,
+          timeoutMs: timeout_ms,
+          maxOutputBytes: max_output_bytes,
+        });
+        return ok({
+          ...result,
+          command_line: commandLine,
+          shell: comspec,
+        } as unknown as Record<string, unknown>);
+      } catch (err: unknown) {
+        return fail((err as Error).message);
+      }
+    }
+  );
+
+  server.registerTool(
     "run_commands",
     {
       title: "Run multiple commands in one call",

@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-file-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A local MCP server that lets ChatGPT read and edit local files, including an opt-in raw write_any_file(path, content) tool.",
   "type": "module",
   "license": "MIT",

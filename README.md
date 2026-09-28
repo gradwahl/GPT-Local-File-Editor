@@ -180,6 +180,7 @@ Terminal/development tools are also available:
 
 ```text
 run_command
+run_windows_command
 run_commands
 check_project
 start_process
@@ -223,6 +224,22 @@ PATHEXT, shebangs, and `.cmd`/`.bat` shims internally. For example:
 
 Command working directories must stay inside the active workspace. The active
 workspace's `node_modules/.bin` is prepended to `PATH` for command execution.
+
+On Windows, `run_windows_command` is available for commands that intentionally
+need `cmd.exe`, including `.bat`/`.cmd` scripts, CMD built-ins, command chaining,
+pipes, and redirection. For example, with a workspace containing `Build.bat`:
+
+```json
+{
+  "command_line": "Build.bat --no-pause",
+  "cwd": ".",
+  "timeout_ms": 120000
+}
+```
+
+The Windows launcher rebuilds the TypeScript project every time it starts, so a
+previously generated `dist/` directory cannot leave ChatGPT connected to a stale
+tool schema after source changes.
 
 Terminal stdout and stderr are ANSI-sanitized before buffering and before they are
 returned through MCP. Color/style sequences such as `ESC[31m`, OSC hyperlinks/title
